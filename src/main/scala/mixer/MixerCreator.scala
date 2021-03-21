@@ -8,6 +8,7 @@ import scala.concurrent.Future
 import scala.math.BigDecimal
 import scala.util.{Try, Success, Failure}
 import akka.actor.Actor
+import akka.actor.ActorRef
 import akka.actor.Props
 import akka.pattern.ask
 import akka.util.Timeout
@@ -31,15 +32,17 @@ class MixerCreator extends Actor{
       state.save()
     }
 
-    def balances(address: String) = _balances(address)
+    def balances(address: String) = _balances.synchronized{
+      _balances(address)
+    }
     def newBalance(account: String) = {
       _balances = _balances + (account -> "0")
     }
-    def addBalance(account: String, amount: BigDecimal) = synchronized{
+    def addBalance(account: String, amount: BigDecimal) = _balances.synchronized{
       val curr = BigDecimal(balances(account))
       _balances = _balances + (account -> (curr + amount).toString)
     }
-    def subtractBalance(account: String, amount: BigDecimal) = synchronized{
+    def subtractBalance(account: String, amount: BigDecimal) = _balances.synchronized{
       val curr = BigDecimal(balances(account))
       _balances = _balances + (account -> (curr - amount).toString)
     }
@@ -61,11 +64,20 @@ class MixerCreator extends Actor{
     state.load()
   }
   val houseAddress = "a79f1151-957f-42ec-a525-24768d3327f2"
-  val minIncrement = 0.00005
   def system = context.system
   def config = system.settings.config
 
+  val maxFee = config.getDouble("jobcoin.maxFee")
   val stateLocation = config.getString("jobcoin.stateLocation")
+  val factorTx = {
+    val r = Math.abs(config.getDouble("jobcoin.transferFactor"))
+    if(r < 1) r + 1
+    else r
+  }
+  val poll = config.getInt("jobcoin.pollInterval")
+  val mixPoll = (poll.toDouble / factorTx).toInt
+  val minTx =
+    Math.abs(config.getDouble("jobcoin.minimumTransfer"))
   val _defaultTimeout = config.getInt("jobcoin.defaultTimeout")
   implicit val defaultTimeout =
     Timeout(
@@ -111,59 +123,72 @@ class MixerCreator extends Actor{
           }.fold(Future()){(a, b) =>
             a.flatMap(_ => b)
           }.transform{_ =>
-            Try{system.scheduler.scheduleOnce(
-              Duration.ofMillis(config.getInt("jobcoin.pollInterval")),
-              self, Transfer(None, None),
-              system.dispatcher, null)}
+            delay(self, Transfer(None, None))
           }
         case (Some(source), Some(amount)) =>
           val transfer = (network() ? MixerNetwork.Transfer(source, houseAddress, amount))
-          transfer.onComplete{
-            case Success(_) =>
-              data.addBalance(source, amount)
-              self ! Mix(source)
-            case Failure(_) =>
-              //pass
+          transfer.onComplete{t =>
+            t match{
+              case Success(_) =>
+                data.addBalance(source, amount)
+              case Failure(_) =>
+                //pass
+            }
+            self ! Mix(source)
           }
         case _ => //pass
       }
   }
 
-  def mix(address: String) = {
-    val addresses = scala.util.Random.shuffle(data.addresses(address))
-    val rawBalance = data.balances(address)
-    val balance = balanceMinusFee(rawBalance)
-    val amount = balance / (addresses.size)
+  def delay(target: ActorRef, message: Any, wait: Int = poll): Try[Unit] = {
+    Try{system.scheduler.scheduleOnce(
+      Duration.ofMillis(wait),
+      target, message,
+      system.dispatcher, null)}
+  }
 
-    @annotation.tailrec
-    def recurse(addresses: Seq[String], balance: BigDecimal): Unit = {
-      if(0 < balance){
-        addresses match{
-          case Seq() =>
+  def mix(address: String) = {
+    //choose random mix address
+    val targets = scala.util.Random.shuffle(data.addresses(address))
+    val target = targets(0)
+
+    computeFee(data.balances(address)).foreach{case (rawBalance, fee) =>
+      val balance = rawBalance - fee
+      data.subtractBalance(address, fee)
+
+      val amount: BigDecimal = {
+        val amt = balance / factorTx / targets.size
+        if(minTx < amt) amt
+        else if(minTx < balance) BigDecimal(minTx)
+        else balance
+      }
+      println(s"vvvvv\naddress: $address\nbalance: $rawBalance\nafterFee: $balance\ntx: $amount\n^^^^^")
+      val message = MixerNetwork.Transfer(houseAddress, target, amount)
+      (network() ? message).onComplete{t =>
+        t match{
+          case Success(_) =>
+            data.subtractBalance(address, amount)
+          case Failure(th) =>
             // pass
-          case target +: tail =>
-            val newBalance = balance - amount
-            (network() ? MixerNetwork.Transfer(houseAddress, target, amount)).map{
-              case Success(_) =>
-                data.subtractBalance(address, amount)
-              case Failure(th) =>
-                // pass
-            }
-            recurse(tail, newBalance)
+        }
+        if(0 < BigDecimal(data.balances(address))){
+          delay(self, Mix(address), mixPoll)
         }
       }
     }
-    recurse(addresses, balance)
   }
 
-  def balanceMinusFee(rawBalance: String): BigDecimal = {
+  def computeFee(rawBalance: String): Option[(BigDecimal, BigDecimal)] = {
     val balance = BigDecimal(rawBalance)
-    val truncate = BigDecimal(balance.toInt)
-    val fee =
-      // basically 1% or a small fraction of a coin whichever is least
-      ((balance - truncate) * 0.00005).min(balance * 0.01)
-
-    return balance - fee
+    if(balance <= 0) None
+    else {
+      val factor = ((0.005 + scala.util.Random.nextFloat * 0.005) / factorTx)
+      val fee = balance * factor
+      Some(
+        (balance,
+        if(maxFee < fee) maxFee
+        else fee))
+    }
   }
 }
 

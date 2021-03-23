@@ -21,6 +21,10 @@ object JobcoinMixer {
     implicit val actorSystem = ActorSystem()
     implicit val materializer = ActorMaterializer()
 
+    val onFinish: scala.collection.mutable.Buffer[(() => Unit)] =
+      scala.collection.mutable.Buffer(() =>
+        actorSystem.terminate())
+
     // Load Config
     val config = ConfigFactory.load()
     implicit val defaultTimeout =
@@ -29,8 +33,30 @@ object JobcoinMixer {
         java.util.concurrent.TimeUnit.MILLISECONDS)
 
     // Test HTTP client
-    // val client = new JobcoinClient(config)
-    // client.testGet().map(response => println(s"Response:\n$response"))
+    //{
+    //  import java.util.concurrent._
+    //  val client = new JobcoinClient(config)
+    //  ;
+    //  val ex = new ScheduledThreadPoolExecutor(1)
+    //  val tPost = new Runnable {
+    //    def run() = {
+    //      client.testPost().foreach(response =>
+    //          println(s"Response:\n$response"))
+    //    }
+    //  }
+    //  val tGet = new Runnable {
+    //    def run() = {
+    //    client.testGet().foreach(
+    //      _.foreach(response =>
+    //        println(s"Response:\n$response")))
+    //    }
+    //  }
+    //  val posting = ex.scheduleAtFixedRate(tPost, 0, 1, TimeUnit.SECONDS)
+    //  val getting = ex.scheduleAtFixedRate(tGet, 1, 10, TimeUnit.MINUTES)
+    //  onFinish += (() => posting.cancel(false))
+    //  onFinish += (() => getting.cancel(false))
+    //  println("Test Client Running")
+    //}
 
     try {
       val mixerCreator = actorSystem.actorOf(Props[MixerCreator], name = "helloactor")
@@ -55,7 +81,7 @@ object JobcoinMixer {
     } catch {
       case CompletedException => println("Quitting...")
     } finally {
-      actorSystem.terminate()
+      onFinish.foreach(_())
     }
   }
 

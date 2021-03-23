@@ -23,6 +23,7 @@ class MixerCreator extends Actor{
   object data{
     private var _addresses = HashMap[String, Seq[String]]()
     private var _balances = HashMap[String, String]()
+    private var _mixing = Set[String]()
     val stateLocation = config.getString("jobcoin.stateLocation")
 
     def allAddresses = _addresses
@@ -33,19 +34,37 @@ class MixerCreator extends Actor{
     }
 
     def balances(address: String) = _balances.synchronized{
-      _balances(address)
+      _balances.getOrElse(address, "0")
     }
     def newBalance(account: String) = {
       _balances = _balances + (account -> "0")
     }
     def addBalance(account: String, amount: BigDecimal) = _balances.synchronized{
-      val curr = BigDecimal(balances(account))
-      _balances = _balances + (account -> (curr + amount).toString)
+      alterBalance(account, amount, _ + _)
     }
     def subtractBalance(account: String, amount: BigDecimal) = _balances.synchronized{
-      val curr = BigDecimal(balances(account))
-      _balances = _balances + (account -> (curr - amount).toString)
+      alterBalance(account, amount, _ - _)
     }
+    def alterBalance(account: String, amount: BigDecimal, op: (BigDecimal, BigDecimal) => BigDecimal) = _balances.synchronized{
+      val curr = BigDecimal(balances(account))
+      val balance = {
+        val rawBalance = op(curr, amount)
+        val balance =
+          if(0 < rawBalance) rawBalance
+          else 0
+
+        balance.toString
+      }
+      _balances = _balances + (account -> balance)
+      state.save()
+    }
+
+    def mixing(state: Boolean, address: String) = {
+      //println(s"mixing $address $state")
+      if(state) _mixing = _mixing + address
+      else _mixing = _mixing - address
+    }
+    def getMixing() = _mixing
 
     private object state{
       import java.io._
@@ -53,28 +72,37 @@ class MixerCreator extends Actor{
         val writer = new ObjectOutputStream(new FileOutputStream(stateLocation))
         writer.writeObject(_addresses)
         writer.writeObject(_balances)
+        writer.flush()
+        writer.close()
       }
 
       def load() = Try{
         val reader = new ObjectInputStream(new FileInputStream(stateLocation))
         _addresses = reader.readObject().asInstanceOf[HashMap[String, Seq[String]]]
         _balances = reader.readObject().asInstanceOf[HashMap[String,String]]
+        //println(_addresses)
+        //println(_balances)
       }
     }
-    state.load()
+    state.load() match{
+      case Success(_) => //pass
+      case Failure(th) =>
+        th.printStackTrace()
+    }
   }
-  val houseAddress = "a79f1151-957f-42ec-a525-24768d3327f2"
   def system = context.system
   def config = system.settings.config
 
+  val houseAddress = config.getString("jobcoin.houseAddress")
   val maxFee = config.getDouble("jobcoin.maxFee")
   val stateLocation = config.getString("jobcoin.stateLocation")
-  val factorTx = {
+  val factorTx: Double = {
     val r = Math.abs(config.getDouble("jobcoin.transferFactor"))
     if(r < 1) r + 1
     else r
   }
   val poll = config.getInt("jobcoin.pollInterval")
+  val pollMix = (poll.toDouble / factorTx).toInt - 1
   val mixPoll = (poll.toDouble / factorTx).toInt
   val minTx =
     Math.abs(config.getDouble("jobcoin.minimumTransfer"))
@@ -110,8 +138,18 @@ class MixerCreator extends Actor{
       self ! SaveState
     case RetrieveAddresses(address) =>
       sender ! data.addresses(address)
-    case Mix(address) =>
-      mix(address)
+    case Mix(addressO) => addressO match {
+      case None =>
+        var idx = 0
+        data.getMixing().foreach{address =>
+          idx = idx + 1
+          (0 to factorTx.toInt).foreach{i =>
+            delay(self, Mix(Some(address)), pollMix * (i + 1))
+          }
+        }
+      case Some(address) =>
+        mix(address)
+    }
     case Transfer(address, amount) =>
       (address, amount) match{
         case (None, _) =>
@@ -123,6 +161,7 @@ class MixerCreator extends Actor{
           }.fold(Future()){(a, b) =>
             a.flatMap(_ => b)
           }.transform{_ =>
+            delay(self, Mix(None))
             delay(self, Transfer(None, None))
           }
         case (Some(source), Some(amount)) =>
@@ -134,7 +173,7 @@ class MixerCreator extends Actor{
               case Failure(_) =>
                 //pass
             }
-            self ! Mix(source)
+            data.mixing(true, source)
           }
         case _ => //pass
       }
@@ -148,6 +187,7 @@ class MixerCreator extends Actor{
   }
 
   def mix(address: String) = {
+    //println("mix " + address)
     //choose random mix address
     val targets = scala.util.Random.shuffle(data.addresses(address))
     val target = targets(0)
@@ -162,7 +202,7 @@ class MixerCreator extends Actor{
         else if(minTx < balance) BigDecimal(minTx)
         else balance
       }
-      println(s"vvvvv\naddress: $address\nbalance: $rawBalance\nafterFee: $balance\ntx: $amount\n^^^^^")
+      //println(s"vvvvv\naddress: $address\nbalance: $rawBalance\nafterFee: $balance\ntx: $amount\n^^^^^")
       val message = MixerNetwork.Transfer(houseAddress, target, amount)
       (network() ? message).onComplete{t =>
         t match{
@@ -171,8 +211,8 @@ class MixerCreator extends Actor{
           case Failure(th) =>
             // pass
         }
-        if(0 < BigDecimal(data.balances(address))){
-          delay(self, Mix(address), mixPoll)
+        if(BigDecimal(data.balances(address)) <= 0){
+          data.mixing(false, address)
         }
       }
     }
@@ -182,7 +222,7 @@ class MixerCreator extends Actor{
     val balance = BigDecimal(rawBalance)
     if(balance <= 0) None
     else {
-      val factor = ((0.005 + scala.util.Random.nextFloat * 0.005) / factorTx)
+      val factor = ((0.001 + scala.util.Random.nextFloat * 0.005) / factorTx)
       val fee = balance * factor
       Some(
         (balance,
@@ -197,7 +237,7 @@ object MixerCreator{
   //requests
   final case class CreateMixer(addresses: Seq[String]) extends CreatorMessage
   final case class RetrieveAddresses(address: String) extends CreatorMessage
-  final case class Mix(address: String)
+  final case class Mix(address: Option[String]) extends CreatorMessage
   final case class Transfer(address: Option[String] = None, amount: Option[BigDecimal] = None)
   final case object SaveState extends CreatorMessage
 
